@@ -1,28 +1,33 @@
-# Project Repository
+# PCB Enclosure Generator
 
-This repository contains the codebase for [Project Name], a [brief description of what the project does].
+This repository contains a Python script for generating 3D printable enclosure STL files from PCB STEP models using CadQuery.
 
 ## Overview
 
-[Provide a more detailed overview of the project's purpose and functionality.]
-
-## Getting Started
-
-[Instructions on how to set up and run the project.]
+The `gen-pcb-base.py` script automates the creation of custom PCB enclosures by:
+- Reading PCB STEP files
+- Detecting mounting holes and creating matching standoffs
+- Setting wall height to 5mm above the tallest component
+- Detecting edge connector solids and creating wall cutouts
+- Supporting both single-board and multi-board panel modes
 
 ## Features
 
-[List key features of the project.]
+- Automatic mounting hole detection and standoff generation
+- Wall cutout detection for edge connectors
+- Configurable parameters for enclosure dimensions
+- PDF template generation for standoff placement
+- CSV output for debugging and analysis
+- Support for multi-board panel layouts via YAML configuration
 
-## Contributing
+## Getting Started
 
-[Guidelines for contributing to the project.]
+### Prerequisites
 
-## License
+- Python 3.7+
+- CadQuery 2.0+
+- PyYAML (for panel mode)
+- Matplotlib (for PDF template generation)
 
-[Include the license information for the project.]
-
-## Contact
-
-[Contact information or links to project maintainers.]
+### Installation
 
