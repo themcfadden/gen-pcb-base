@@ -583,6 +583,7 @@ def build_panel(
         rotation = float(board.get("rotation", 0.0))
         board_standoff_diameter = float(board.get("standoff_diameter", standoff_diameter))
         board_screw_hole_diameter = float(board.get("screw_hole_diameter", screw_hole_diameter))
+        label_rotation = float(board.get("label_rotation", 0.0))
 
         analyzed = analyze_board(step_path, params)
         w = analyzed["pcb_w"]
@@ -643,6 +644,7 @@ def build_panel(
             {
                 "name": name,
                 "label": label,
+                "label_rotation": label_rotation,
                 "board_w": w,
                 "board_h": h,
                 "x": x,
@@ -701,6 +703,7 @@ def build_panel(
     # Emboss board label under each board, wrapping text to stay inside footprint.
     for placement in placements:
         label = placement["label"]
+        label_rotation = placement["label_rotation"]
         lines, font_size = wrap_label_to_fit(label, placement["board_w"], placement["board_h"], params)
         line_pitch = font_size * 1.28
         total_height = line_pitch * (len(lines) - 1)
@@ -710,7 +713,7 @@ def build_panel(
             y_offset = -total_height / 2.0 + i * line_pitch
             text_wp = (
                 cq.Workplane("XY")
-                .transformed(offset=(tx, ty, base_thickness), rotate=(0, 0, placement["rotation"]))
+                .transformed(offset=(tx, ty, base_thickness), rotate=(0, 0, placement["rotation"] + label_rotation))
                 .center(0.0, y_offset)
                 .text(
                     line,
