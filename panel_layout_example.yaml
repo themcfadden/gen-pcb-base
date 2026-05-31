@@ -24,7 +24,7 @@ boards:
     x: 95.0
     y: 45.0
     rotation: 180.0
-    label_rotation: 180.0
+    label_rotation: 90.0
     standoff_diameter: 7.0
     screw_hole_diameter: 3.2
     exclude_standoffs:

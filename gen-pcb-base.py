@@ -276,6 +276,7 @@ def write_panel_standoff_template_pdf(
     panel_height: float,
     board_outlines: List[List[Tuple[float, float]]],
     standoff_holes: List[Tuple[float, float, float]],
+    board_labels: List[dict],
 ) -> None:
     """Write a 1:1 printable PDF for a multi-board panel layout."""
     try:
@@ -313,6 +314,32 @@ def write_panel_standoff_template_pdf(
         mark = 1.2
         ax.plot([x - mark, x + mark], [y, y], color="black", linewidth=0.5)
         ax.plot([x, x], [y - mark, y + mark], color="black", linewidth=0.5)
+
+    # Draw board labels so the printable template matches embossed panel text.
+    for label_spec in board_labels:
+        tx = float(label_spec["x"])
+        ty = float(label_spec["y"])
+        angle = float(label_spec["rotation"])
+        lines = label_spec["lines"]
+        font_size_mm = float(label_spec["font_size_mm"])
+        line_pitch = font_size_mm * 1.28
+        total_height = line_pitch * (len(lines) - 1)
+        font_points = font_size_mm * 72.0 / 25.4
+
+        for i, line in enumerate(lines):
+            y_offset = total_height / 2.0 - i * line_pitch
+            ox, oy = rotate_point(0.0, y_offset, angle)
+            ax.text(
+                tx + ox,
+                ty + oy,
+                line,
+                fontsize=font_points,
+                rotation=angle,
+                rotation_mode="anchor",
+                ha="center",
+                va="center",
+                color="black",
+            )
 
     fig.savefig(str(output_pdf), format="pdf", bbox_inches="tight", pad_inches=0.0)
     plt.close(fig)
@@ -685,6 +712,7 @@ def build_panel(
     all_standoff_points = []
     pdf_outlines = []
     pdf_holes = []
+    pdf_labels = []
 
     for placement in placements:
         outline = [to_panel(x, y) for x, y in placement["corners_world"]]
@@ -709,9 +737,9 @@ def build_panel(
         total_height = line_pitch * (len(lines) - 1)
         tx, ty = to_panel(placement["x"], placement["y"])
 
-        # Process lines in the correct order (top to bottom)
+        # Place first wrapped line at the top, then step downward.
         for i, line in enumerate(lines):
-            y_offset = -total_height / 2.0 + i * line_pitch
+            y_offset = total_height / 2.0 - i * line_pitch
             text_wp = (
                 cq.Workplane("XY")
                 .transformed(offset=(tx, ty, base_thickness), rotate=(0, 0, placement["rotation"] + label_rotation))
@@ -726,6 +754,16 @@ def build_panel(
                 )
             )
             panel = panel.union(text_wp)
+
+        pdf_labels.append(
+            {
+                "x": tx,
+                "y": ty,
+                "rotation": placement["rotation"] + label_rotation,
+                "lines": lines,
+                "font_size_mm": font_size,
+            }
+        )
 
     if all_standoff_points:
         for placement in placements:
@@ -759,7 +797,14 @@ def build_panel(
             panel = panel.cut(screw_holes)
 
     exporters.export(panel, str(output_stl))
-    write_panel_standoff_template_pdf(output_pdf, panel_w, panel_h, pdf_outlines, pdf_holes)
+    write_panel_standoff_template_pdf(
+        output_pdf,
+        panel_w,
+        panel_h,
+        pdf_outlines,
+        pdf_holes,
+        pdf_labels,
+    )
     write_panel_local_holes_csv(output_local_holes_csv, local_hole_rows)
 
     print(f"Input layout YAML: {layout_yaml}")
