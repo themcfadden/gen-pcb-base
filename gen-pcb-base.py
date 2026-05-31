@@ -709,6 +709,7 @@ def build_panel(
         total_height = line_pitch * (len(lines) - 1)
         tx, ty = to_panel(placement["x"], placement["y"])
 
+        # Process lines in the correct order (top to bottom)
         for i, line in enumerate(lines):
             y_offset = -total_height / 2.0 + i * line_pitch
             text_wp = (
