@@ -1,6 +1,6 @@
 # PCB Enclosure Generator
 
-This repository contains a Python script for generating 3D printable enclosure STL files from PCB STEP models using CadQuery.
+This repository contains a Python script for generating 3D printable enclosure STL files from PCB STEP models using CADQuery.
 
 ## Overview
 
