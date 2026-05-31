@@ -1,0 +1,30 @@
+panel:
+  margin: 10.0
+  base_thickness: 2.8
+  standoff_height: 3.0
+  standoff_diameter: 6.0
+  screw_hole_diameter: 2.8
+  exclude_xy_tolerance: 0.1
+
+boards:
+  - name: carrier_left
+    label: Carrier Left
+    step: ARK_PAB_Carrier_3D_Model.step
+    x: 30.0
+    y: 45.0
+    rotation: 0.0
+    standoff_diameter: 6.0
+    screw_hole_diameter: 2.8
+    exclude_standoffs:
+      - { index: 0 }
+
+  - name: carrier_right
+    label: Carrier Right With A Really Long Name That Should Be Truncated
+    step: ARK_PAB_Carrier_3D_Model.step
+    x: 95.0
+    y: 45.0
+    rotation: 180.0
+    standoff_diameter: 7.0
+    screw_hole_diameter: 3.2
+    exclude_standoffs:
+      - { xy: [19.25, 34.5] }
