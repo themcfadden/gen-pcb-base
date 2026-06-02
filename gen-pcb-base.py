@@ -14,9 +14,10 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cadquery as cq
 from cadquery import exporters
@@ -51,6 +52,37 @@ class SideCutout:
     z_bottom: float
     width_xy: float
     height_z: float
+
+
+class ProgressBar:
+    """Minimal terminal progress bar for long-running stages."""
+
+    def __init__(self, total: int, title: str) -> None:
+        self.total = max(1, int(total))
+        self.current = 0
+        self.title = title
+        self._last_render_len = 0
+        self._render("starting")
+
+    def advance(self, message: str = "") -> None:
+        self.current = min(self.total, self.current + 1)
+        self._render(message)
+        if self.current >= self.total:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    def _render(self, message: str) -> None:
+        width = 28
+        ratio = self.current / self.total
+        filled = int(width * ratio)
+        bar = "#" * filled + "-" * (width - filled)
+        percent = int(ratio * 100.0)
+        suffix = f" {message}" if message else ""
+        line = f"[{self.title}] [{bar}] {percent:3d}% ({self.current}/{self.total}){suffix}"
+        pad = " " * max(0, self._last_render_len - len(line))
+        sys.stderr.write(f"\r{line}{pad}")
+        self._last_render_len = len(line)
+        sys.stderr.flush()
 
 
 def rotate_point(x: float, y: float, angle_deg: float) -> Tuple[float, float]:
@@ -275,8 +307,12 @@ def write_panel_standoff_template_pdf(
     panel_width: float,
     panel_height: float,
     board_outlines: List[List[Tuple[float, float]]],
-    standoff_holes: List[Tuple[float, float, float]],
+    board_centers: List[Dict[str, Any]],
+    standoff_holes: List[Dict[str, Any]],
     board_labels: List[dict],
+    grid_enabled: bool = True,
+    grid_minor_mm: float = 5.0,
+    grid_major_mm: float = 25.0,
 ) -> None:
     """Write a 1:1 printable PDF for a multi-board panel layout."""
     try:
@@ -294,6 +330,54 @@ def write_panel_standoff_template_pdf(
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
+    if grid_enabled:
+        minor = max(1.0, float(grid_minor_mm))
+        major = max(minor, float(grid_major_mm))
+
+        x = 0.0
+        while x <= panel_width + 1e-6:
+            is_major = abs((x / major) - round(x / major)) < 1e-6
+            ax.plot(
+                [x, x],
+                [0.0, panel_height],
+                color="#888888" if is_major else "#C8C8C8",
+                linewidth=0.35 if is_major else 0.2,
+                zorder=0,
+            )
+            if is_major:
+                ax.text(
+                    x + 0.8,
+                    0.8,
+                    f"{int(round(x))}",
+                    fontsize=4.5,
+                    ha="left",
+                    va="bottom",
+                    color="#666666",
+                )
+            x += minor
+
+        y = 0.0
+        while y <= panel_height + 1e-6:
+            is_major = abs((y / major) - round(y / major)) < 1e-6
+            ax.plot(
+                [0.0, panel_width],
+                [y, y],
+                color="#888888" if is_major else "#C8C8C8",
+                linewidth=0.35 if is_major else 0.2,
+                zorder=0,
+            )
+            if is_major:
+                ax.text(
+                    0.8,
+                    y + 0.8,
+                    f"{int(round(y))}",
+                    fontsize=4.5,
+                    ha="left",
+                    va="bottom",
+                    color="#666666",
+                )
+            y += minor
+
     border = patches.Rectangle(
         (0.0, 0.0),
         panel_width,
@@ -308,12 +392,41 @@ def write_panel_standoff_template_pdf(
         poly = patches.Polygon(outline, closed=True, linewidth=0.7, edgecolor="black", facecolor="none")
         ax.add_patch(poly)
 
-    for x, y, d in standoff_holes:
+    for center in board_centers:
+        cx = float(center["x"])
+        cy = float(center["y"])
+        ax.text(
+            cx + 1.8,
+            cy - 1.8,
+            f"({cx:.1f}, {cy:.1f})",
+            fontsize=5.0,
+            ha="left",
+            va="top",
+            color="#333333",
+        )
+
+    for hole in standoff_holes:
+        x = float(hole["x"])
+        y = float(hole["y"])
+        d = float(hole["d"])
+        index_label = str(hole.get("index", ""))
+
         hole = patches.Circle((x, y), d / 2.0, linewidth=0.8, edgecolor="black", facecolor="none")
         ax.add_patch(hole)
         mark = 1.2
         ax.plot([x - mark, x + mark], [y, y], color="black", linewidth=0.5)
         ax.plot([x, x], [y - mark, y + mark], color="black", linewidth=0.5)
+
+        if index_label:
+            ax.text(
+                x + 1.8,
+                y + 1.8,
+                index_label,
+                fontsize=5.0,
+                ha="left",
+                va="bottom",
+                color="black",
+            )
 
     # Draw board labels so the printable template matches embossed panel text.
     for label_spec in board_labels:
@@ -521,19 +634,48 @@ def detect_connector_cutouts(all_solids, pcb_solid, pcb_bbox, params: Params) ->
     return cutouts
 
 
-def load_layout_yaml(layout_yaml: Path) -> Dict:
+def _require_yaml_module():
     try:
         import yaml
     except Exception as exc:
         raise RuntimeError(
-            "PyYAML is required for --layout-yaml. Install with: pip install pyyaml"
+            "PyYAML is required for layout and intermediate YAML support. Install with: pip install pyyaml"
         ) from exc
+    return yaml
 
-    with layout_yaml.open("r", encoding="utf-8") as f:
+
+def write_yaml_file(path: Path, data: Dict[str, Any]) -> None:
+    yaml = _require_yaml_module()
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+
+
+def load_yaml_file(path: Path) -> Dict[str, Any]:
+    yaml = _require_yaml_module()
+    with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-
     if not isinstance(data, dict):
-        raise RuntimeError("Layout YAML root must be a mapping")
+        raise RuntimeError(f"YAML root must be a mapping: {path}")
+    return data
+
+
+def rotate_side(side: str, angle_deg: float) -> str:
+    side_vecs = {
+        "x-": (-1.0, 0.0),
+        "x+": (1.0, 0.0),
+        "y-": (0.0, -1.0),
+        "y+": (0.0, 1.0),
+    }
+    vx, vy = side_vecs.get(side, (-1.0, 0.0))
+    rx, ry = rotate_point(vx, vy, angle_deg)
+    if abs(rx) >= abs(ry):
+        return "x+" if rx >= 0.0 else "x-"
+    return "y+" if ry >= 0.0 else "y-"
+
+
+def load_layout_yaml(layout_yaml: Path) -> Dict:
+    data = load_yaml_file(layout_yaml)
+
     if "boards" not in data or not isinstance(data["boards"], list) or not data["boards"]:
         raise RuntimeError("Layout YAML must contain a non-empty 'boards' list")
 
@@ -557,20 +699,135 @@ def analyze_board(step_path: Path, params: Params) -> Dict:
     top_circles = extract_circles(top_face, params, "top")
     bottom_circles = extract_circles(bottom_face, params, "bottom")
     holes = find_through_holes(top_circles, bottom_circles, params)
+    cutouts = detect_connector_cutouts(all_solids, pcb, pcb_bbox, params)
 
     local_holes = [(x - pcb_cx, y - pcb_cy, d) for x, y, d in holes]
+    local_cutouts = [
+        {
+            "side": c.side,
+            "x_local_mm": c.center_xy[0],
+            "y_local_mm": c.center_xy[1],
+            "z_bottom_mm": c.z_bottom,
+            "width_mm": c.width_xy,
+            "height_mm": c.height_z,
+        }
+        for c in cutouts
+    ]
 
     return {
         "pcb_w": pcb_w,
         "pcb_h": pcb_h,
         "local_holes": local_holes,
+        "local_cutouts": local_cutouts,
     }
 
 
-def build_panel(
+def parse_template_size(board: Dict[str, Any], idx: int) -> Tuple[float, float]:
+    size_mm = board.get("size_mm")
+    if not isinstance(size_mm, (list, tuple)) or len(size_mm) < 2:
+        raise RuntimeError(f"boards[{idx}] kind=template requires size_mm: [width, height]")
+
+    try:
+        w = float(size_mm[0])
+        h = float(size_mm[1])
+    except Exception as exc:
+        raise RuntimeError(f"boards[{idx}].size_mm values must be numeric") from exc
+
+    if w <= 0.0 or h <= 0.0:
+        raise RuntimeError(f"boards[{idx}].size_mm values must be > 0")
+    return w, h
+
+
+def parse_template_standoffs(
+    board: Dict[str, Any],
+    idx: int,
+    default_hole_diameter: float,
+) -> List[Tuple[float, float, float]]:
+    standoffs = board.get("standoffs", [])
+    if standoffs is None:
+        standoffs = []
+    if not isinstance(standoffs, list):
+        raise RuntimeError(f"boards[{idx}].standoffs must be a list for kind=template")
+
+    holes: List[Tuple[float, float, float]] = []
+    for item_index, item in enumerate(standoffs):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"boards[{idx}].standoffs[{item_index}] must be a mapping")
+        xy = item.get("xy")
+        if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+            raise RuntimeError(f"boards[{idx}].standoffs[{item_index}] requires xy: [x, y]")
+
+        try:
+            x = float(xy[0])
+            y = float(xy[1])
+            d = float(item.get("hole_diameter", item.get("hole_diameter_mm", default_hole_diameter)))
+        except Exception as exc:
+            raise RuntimeError(
+                f"boards[{idx}].standoffs[{item_index}] contains non-numeric values"
+            ) from exc
+
+        if d <= 0.0:
+            raise RuntimeError(f"boards[{idx}].standoffs[{item_index}] hole diameter must be > 0")
+        holes.append((x, y, d))
+
+    return sorted(holes, key=lambda hole: (hole[1], hole[0]))
+
+
+def parse_template_cutouts(board: Dict[str, Any], idx: int) -> List[Dict[str, float]]:
+    cutouts = board.get("wall_cutouts", [])
+    if cutouts is None:
+        cutouts = []
+    if not isinstance(cutouts, list):
+        raise RuntimeError(f"boards[{idx}].wall_cutouts must be a list for kind=template")
+
+    parsed: List[Dict[str, float]] = []
+    for item_index, item in enumerate(cutouts):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"boards[{idx}].wall_cutouts[{item_index}] must be a mapping")
+
+        side = str(item.get("side", "")).strip().lower()
+        if side not in ("x-", "x+", "y-", "y+"):
+            raise RuntimeError(
+                f"boards[{idx}].wall_cutouts[{item_index}].side must be one of x-, x+, y-, y+"
+            )
+
+        xy = item.get("xy")
+        if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+            raise RuntimeError(f"boards[{idx}].wall_cutouts[{item_index}] requires xy: [x, y]")
+
+        try:
+            x_local = float(xy[0])
+            y_local = float(xy[1])
+            z_bottom = float(item.get("z_bottom_mm", 0.0))
+            width = float(item.get("width_mm", item.get("width", 0.0)))
+            height = float(item.get("height_mm", item.get("height", 0.0)))
+        except Exception as exc:
+            raise RuntimeError(
+                f"boards[{idx}].wall_cutouts[{item_index}] contains non-numeric values"
+            ) from exc
+
+        if width <= 0.0 or height <= 0.0:
+            raise RuntimeError(
+                f"boards[{idx}].wall_cutouts[{item_index}] width/height must be > 0"
+            )
+
+        parsed.append(
+            {
+                "side": side,
+                "x_local_mm": x_local,
+                "y_local_mm": y_local,
+                "z_bottom_mm": z_bottom,
+                "width_mm": width,
+                "height_mm": height,
+            }
+        )
+
+    return parsed
+
+
+def analyze_layout_to_intermediate(
     layout_yaml: Path,
-    output_stl: Path,
-    output_pdf: Path,
+    intermediate_yaml: Path,
     output_local_holes_csv: Path,
     params: Params,
 ) -> None:
@@ -582,59 +839,95 @@ def build_panel(
 
     panel_margin = float(panel_cfg.get("margin", 8.0))
     base_thickness = float(panel_cfg.get("base_thickness", params.base_thickness))
-    standoff_height = float(panel_cfg.get("standoff_height", params.standoff_height))
+    wall_height = float(panel_cfg.get("wall_height", 0.0))
+    wall_thickness = float(panel_cfg.get("wall_thickness", params.wall_thickness))
+    standoff_height_default = float(panel_cfg.get("standoff_height", params.standoff_height))
     standoff_diameter = float(panel_cfg.get("standoff_diameter", params.standoff_diameter))
     screw_hole_diameter = float(panel_cfg.get("screw_hole_diameter", params.screw_hole_diameter))
-    exclude_xy_tolerance = float(panel_cfg.get("exclude_xy_tolerance", 0.08))
+    label_height = float(panel_cfg.get("label_height", params.label_height))
+    auto_gap_x = float(panel_cfg.get("auto_gap_x", panel_margin))
+    auto_gap_y = float(panel_cfg.get("auto_gap_y", panel_margin))
+    auto_origin_x = float(panel_cfg.get("auto_origin_x", 0.0))
+    auto_origin_y = float(panel_cfg.get("auto_origin_y", 0.0))
+    pdf_grid_enabled = bool(panel_cfg.get("pdf_grid_enabled", True))
+    pdf_grid_minor_mm = float(panel_cfg.get("pdf_grid_minor_mm", 5.0))
+    pdf_grid_major_mm = float(panel_cfg.get("pdf_grid_major_mm", 25.0))
+    _max_size_raw = panel_cfg.get("max_panel_size_mm", [250.0, 250.0])
+    if not (isinstance(_max_size_raw, (list, tuple)) and len(_max_size_raw) == 2):
+        raise RuntimeError("panel.max_panel_size_mm must be a list of [width, height]")
+    max_panel_w = float(_max_size_raw[0])
+    max_panel_h = float(_max_size_raw[1])
+    max_usable_w = max_panel_w - 2.0 * panel_margin
 
+    if wall_height < 0.0:
+        raise RuntimeError("panel.wall_height must be >= 0")
+    if pdf_grid_minor_mm <= 0.0:
+        raise RuntimeError("panel.pdf_grid_minor_mm must be > 0")
+    if pdf_grid_major_mm <= 0.0:
+        raise RuntimeError("panel.pdf_grid_major_mm must be > 0")
+
+    board_inputs = []
     placements = []
     all_outline_pts = []
     local_hole_rows: List[dict] = []
+    analyze_bar = ProgressBar(len(data["boards"]), "analyze")
 
     for idx, board in enumerate(data["boards"]):
         if not isinstance(board, dict):
             raise RuntimeError(f"boards[{idx}] must be a mapping")
 
-        step_val = board.get("step")
-        if not step_val:
-            raise RuntimeError(f"boards[{idx}] is missing required field: step")
-
-        step_path = (layout_yaml.parent / str(step_val)).resolve()
-        if not step_path.exists():
-            raise RuntimeError(f"boards[{idx}] STEP not found: {step_path}")
+        board_kind = str(board.get("kind", "step")).strip().lower()
+        if board_kind not in ("step", "template"):
+            raise RuntimeError(f"boards[{idx}].kind must be 'step' or 'template'")
 
         name = str(board.get("name", f"board_{idx + 1}"))
-        label = str(board.get("label", step_path.stem))
-        x = float(board.get("x", 0.0))
-        y = float(board.get("y", 0.0))
+        # Source x/y are intentionally ignored; placement comes from auto-layout
+        # and can be edited in the intermediate YAML.
         rotation = float(board.get("rotation", 0.0))
+        board_standoff_height = float(board.get("standoff_height", standoff_height_default))
         board_standoff_diameter = float(board.get("standoff_diameter", standoff_diameter))
         board_screw_hole_diameter = float(board.get("screw_hole_diameter", screw_hole_diameter))
         label_rotation = float(board.get("label_rotation", 0.0))
+        label_enabled = bool(board.get("label_enabled", True))
 
-        analyzed = analyze_board(step_path, params)
-        w = analyzed["pcb_w"]
-        h = analyzed["pcb_h"]
-        local_holes_all = sorted(analyzed["local_holes"], key=lambda hole: (hole[1], hole[0]))
+        step_name = ""
+        if board_kind == "step":
+            step_val = board.get("step")
+            if not step_val:
+                raise RuntimeError(f"boards[{idx}] kind=step is missing required field: step")
 
-        exclusion_rules = board.get("exclude_standoffs", [])
-        if exclusion_rules is None:
-            exclusion_rules = []
-        if not isinstance(exclusion_rules, list):
-            raise RuntimeError(f"boards[{idx}].exclude_standoffs must be a list")
+            step_path = (layout_yaml.parent / str(step_val)).resolve()
+            if not step_path.exists():
+                raise RuntimeError(f"boards[{idx}] STEP not found: {step_path}")
 
-        local_holes_kept, excluded_map = apply_standoff_exclusions(
-            local_holes_all,
-            exclusion_rules,
-            exclude_xy_tolerance,
-        )
+            step_name = step_path.name
+            label = str(board.get("label", step_path.stem))
+
+            analyzed = analyze_board(step_path, params)
+            w = analyzed["pcb_w"]
+            h = analyzed["pcb_h"]
+            local_holes_all = sorted(analyzed["local_holes"], key=lambda hole: (hole[1], hole[0]))
+            local_cutouts = analyzed["local_cutouts"] if wall_height > 0.0 else []
+        else:
+            label = str(board.get("label", name))
+            w, h = parse_template_size(board, idx)
+            local_holes_all = parse_template_standoffs(board, idx, board_screw_hole_diameter)
+            local_cutouts = parse_template_cutouts(board, idx) if wall_height > 0.0 else []
+
+        if "exclude_standoffs" in board:
+            print(
+                f"Note: boards[{idx}].exclude_standoffs is ignored in source layout; "
+                "exclude standoffs in intermediate YAML via features.standoffs[].enabled"
+            )
+
+        excluded_map: Dict[int, str] = {}
 
         for hole_index, (hx, hy, hd) in enumerate(local_holes_all):
             reason = excluded_map.get(hole_index, "")
             local_hole_rows.append(
                 {
                     "board": name,
-                    "step": step_path.name,
+                    "step": step_name,
                     "hole_index": hole_index,
                     "x_local_mm": f"{hx:.4f}",
                     "y_local_mm": f"{hy:.4f}",
@@ -644,49 +937,133 @@ def build_panel(
                 }
             )
 
-        corners_local = [
-            (-w / 2.0, -h / 2.0),
-            (w / 2.0, -h / 2.0),
-            (w / 2.0, h / 2.0),
-            (-w / 2.0, h / 2.0),
-        ]
-        corners_world = []
-        for cx, cy in corners_local:
-            rx, ry = rotate_point(cx, cy, rotation)
-            wx = x + rx
-            wy = y + ry
-            corners_world.append((wx, wy))
-            all_outline_pts.append((wx, wy))
-
-        hole_points = []
-        hole_draw = []
-        for hx, hy, d in local_holes_kept:
-            rx, ry = rotate_point(hx, hy, rotation)
-            wx = x + rx
-            wy = y + ry
-            hole_points.append((wx, wy))
-            hole_draw.append((wx, wy, d))
-
-        placements.append(
+        board_inputs.append(
             {
                 "name": name,
+                "step": step_name,
+                "kind": board_kind,
                 "label": label,
+                "label_enabled": label_enabled,
                 "label_rotation": label_rotation,
                 "board_w": w,
                 "board_h": h,
-                "x": x,
-                "y": y,
                 "rotation": rotation,
+                "standoff_height": board_standoff_height,
                 "standoff_diameter": board_standoff_diameter,
                 "screw_hole_diameter": board_screw_hole_diameter,
                 "detected_holes": len(local_holes_all),
-                "excluded_holes": len(excluded_map),
-                "active_holes": len(local_holes_kept),
-                "corners_world": corners_world,
-                "holes_xy": hole_points,
-                "holes_draw": hole_draw,
+                "excluded_holes": 0,
+                "active_holes": len(local_holes_all),
+                "local_holes_all": local_holes_all,
+                "local_cutouts": local_cutouts,
+                "excluded_map": excluded_map,
             }
         )
+        analyze_bar.advance(f"board {idx + 1}/{len(data['boards'])}: {name}")
+
+    # Auto-place boards left-to-right, wrapping to new rows when max_panel_w is exceeded.
+    auto_cursor_x = auto_origin_x
+    auto_cursor_y = auto_origin_y
+    row_max_h = 0.0
+    place_bar = ProgressBar(len(board_inputs), "place")
+    for board in board_inputs:
+        angle = math.radians(float(board["rotation"]))
+        footprint_w = abs(float(board["board_w"]) * math.cos(angle)) + abs(float(board["board_h"]) * math.sin(angle))
+        footprint_h = abs(float(board["board_h"]) * math.cos(angle)) + abs(float(board["board_w"]) * math.sin(angle))
+
+        # Wrap to a new row if this board would exceed the usable panel width.
+        if auto_cursor_x > auto_origin_x and auto_cursor_x + footprint_w > auto_origin_x + max_usable_w:
+            auto_cursor_y += row_max_h + auto_gap_y
+            auto_cursor_x = auto_origin_x
+            row_max_h = 0.0
+
+        x = auto_cursor_x + footprint_w / 2.0
+        y = auto_cursor_y
+
+        auto_cursor_x = float(x) + footprint_w / 2.0 + auto_gap_x
+        row_max_h = max(row_max_h, footprint_h)
+
+        corners_local = [
+            (-float(board["board_w"]) / 2.0, -float(board["board_h"]) / 2.0),
+            (float(board["board_w"]) / 2.0, -float(board["board_h"]) / 2.0),
+            (float(board["board_w"]) / 2.0, float(board["board_h"]) / 2.0),
+            (-float(board["board_w"]) / 2.0, float(board["board_h"]) / 2.0),
+        ]
+        corners_world = []
+        for cx, cy in corners_local:
+            rx, ry = rotate_point(cx, cy, float(board["rotation"]))
+            wx = float(x) + rx
+            wy = float(y) + ry
+            corners_world.append((wx, wy))
+            all_outline_pts.append((wx, wy))
+
+        standoff_features = []
+        for hole_index, (hx, hy, d) in enumerate(board["local_holes_all"]):
+            standoff_features.append(
+                {
+                    "id": f"{board['name']}:standoff:{hole_index}",
+                    "hole_index": hole_index,
+                    "enabled": True,
+                    "exclude_reason": "",
+                    "x_local_mm": hx,
+                    "y_local_mm": hy,
+                    "hole_diameter_mm": d,
+                    "standoff_diameter_mm": board["standoff_diameter"],
+                    "screw_hole_diameter_mm": board["screw_hole_diameter"],
+                    "standoff_height_mm": board["standoff_height"],
+                }
+            )
+
+        cutout_features = []
+        for cutout_index, cut in enumerate(board["local_cutouts"]):
+            cutout_features.append(
+                {
+                    "id": f"{board['name']}:cutout:{cutout_index}",
+                    "enabled": True,
+                    "side": str(cut["side"]),
+                    "x_local_mm": float(cut["x_local_mm"]),
+                    "y_local_mm": float(cut["y_local_mm"]),
+                    # z_bottom is recorded relative to base top, including this board's standoff height.
+                    "z_bottom_mm": float(board["standoff_height"]) + float(cut["z_bottom_mm"]),
+                    "width_mm": float(cut["width_mm"]),
+                    "height_mm": float(cut["height_mm"]),
+                }
+            )
+
+        label_lines, label_font_size = wrap_label_to_fit(
+            str(board["label"]),
+            float(board["board_w"]),
+            float(board["board_h"]),
+            params,
+        )
+
+        placements.append(
+            {
+                "name": board["name"],
+                "step": board["step"],
+                "kind": board["kind"],
+                "label": board["label"],
+                "label_enabled": board["label_enabled"],
+                "label_rotation": board["label_rotation"],
+                "label_lines": label_lines,
+                "label_font_size_mm": label_font_size,
+                "board_w": board["board_w"],
+                "board_h": board["board_h"],
+                "x": float(x),
+                "y": float(y),
+                "rotation": board["rotation"],
+                "standoff_height": board["standoff_height"],
+                "standoff_diameter": board["standoff_diameter"],
+                "screw_hole_diameter": board["screw_hole_diameter"],
+                "detected_holes": board["detected_holes"],
+                "excluded_holes": board["excluded_holes"],
+                "active_holes": board["active_holes"],
+                "corners_world": corners_world,
+                "standoffs": standoff_features,
+                "wall_cutouts": cutout_features,
+            }
+        )
+        place_bar.advance(f"{board['name']}")
 
     if not all_outline_pts:
         raise RuntimeError("No board geometry available from layout")
@@ -702,135 +1079,382 @@ def build_panel(
     def to_panel(px: float, py: float) -> Tuple[float, float]:
         return px - min_x + panel_margin, py - min_y + panel_margin
 
-    panel = cq.Workplane("XY").box(
-        panel_w,
-        panel_h,
-        base_thickness,
-        centered=(False, False, False),
-    )
-
-    all_standoff_points = []
-    pdf_outlines = []
-    pdf_holes = []
-    pdf_labels = []
+    boards_spec = []
+    total_standoffs = 0
+    total_cutouts = 0
+    emit_bar = ProgressBar(len(placements), "emit")
 
     for placement in placements:
-        outline = [to_panel(x, y) for x, y in placement["corners_world"]]
-        pdf_outlines.append(outline)
+        standoff_specs = [dict(standoff) for standoff in placement["standoffs"]]
+        cutout_specs = [dict(cutout) for cutout in placement["wall_cutouts"]]
 
-        for x, y in placement["holes_xy"]:
-            sx, sy = to_panel(x, y)
-            all_standoff_points.append((sx, sy))
+        label_x, label_y = to_panel(placement["x"], placement["y"])
 
-        placement["holes_panel_xy"] = [to_panel(x, y) for x, y in placement["holes_xy"]]
-
-        for x, y, d in placement["holes_draw"]:
-            sx, sy = to_panel(x, y)
-            pdf_holes.append((sx, sy, d))
-
-    # Emboss board label under each board, wrapping text to stay inside footprint.
-    for placement in placements:
-        label = placement["label"]
-        label_rotation = placement["label_rotation"]
-        lines, font_size = wrap_label_to_fit(label, placement["board_w"], placement["board_h"], params)
-        line_pitch = font_size * 1.28
-        total_height = line_pitch * (len(lines) - 1)
-        tx, ty = to_panel(placement["x"], placement["y"])
-
-        # Place first wrapped line at the top, then step downward.
-        for i, line in enumerate(lines):
-            y_offset = total_height / 2.0 - i * line_pitch
-            text_wp = (
-                cq.Workplane("XY")
-                .transformed(offset=(tx, ty, base_thickness), rotate=(0, 0, placement["rotation"] + label_rotation))
-                .center(0.0, y_offset)
-                .text(
-                    line,
-                    fontsize=font_size,
-                    distance=params.label_height,
-                    combine=False,
-                    halign="center",
-                    valign="center",
-                )
-            )
-            panel = panel.union(text_wp)
-
-        pdf_labels.append(
+        boards_spec.append(
             {
-                "x": tx,
-                "y": ty,
-                "rotation": placement["rotation"] + label_rotation,
-                "lines": lines,
-                "font_size_mm": font_size,
+                "id": placement["name"],
+                "name": placement["name"],
+                "step": placement.get("step", ""),
+                "kind": placement.get("kind", "step"),
+                # Board center in panel coordinates; edit these to reposition the board.
+                "x_mm": label_x,
+                "y_mm": label_y,
+                "rotation_deg": placement["rotation"],
+                "board_w_mm": placement["board_w"],
+                "board_h_mm": placement["board_h"],
+                "features": {
+                    "standoffs": standoff_specs,
+                    "wall_cutouts": cutout_specs,
+                    "label": {
+                        "id": f"{placement['name']}:label",
+                        "enabled": placement["label_enabled"],
+                        "x_local_mm": 0.0,
+                        "y_local_mm": 0.0,
+                        "rotation_deg": placement["label_rotation"],
+                        "lines": placement["label_lines"],
+                        "font_size_mm": placement["label_font_size_mm"],
+                    },
+                },
+            }
+        )
+        total_standoffs += sum(1 for s in standoff_specs if bool(s.get("enabled", True)))
+        total_cutouts += sum(1 for c in cutout_specs if bool(c.get("enabled", True)))
+        emit_bar.advance(f"{placement['name']}")
+
+    intermediate = {
+        "schema_version": 1,
+        "source_layout": str(layout_yaml),
+        "panel": {
+            "margin_mm": panel_margin,
+            "base_thickness_mm": base_thickness,
+            "wall_height_mm": wall_height,
+            "wall_thickness_mm": wall_thickness,
+            "label_height_mm": label_height,
+            "pdf_grid_enabled": pdf_grid_enabled,
+            "pdf_grid_minor_mm": pdf_grid_minor_mm,
+            "pdf_grid_major_mm": pdf_grid_major_mm,
+        },
+        "panel_size_mm": {
+            "width": panel_w,
+            "height": panel_h,
+        },
+        "boards": boards_spec,
+    }
+
+    write_yaml_file(intermediate_yaml, intermediate)
+    write_panel_local_holes_csv(output_local_holes_csv, local_hole_rows)
+
+    print(f"Input layout YAML: {layout_yaml}")
+    print(f"Output intermediate YAML: {intermediate_yaml}")
+    print(f"Output local holes CSV: {output_local_holes_csv}")
+    print(f"Boards placed: {len(placements)}")
+    print(f"Enabled standoffs: {total_standoffs}")
+    print(f"Enabled wall cutouts: {total_cutouts}")
+    print(f"Panel size (mm): {panel_w:.2f} x {panel_h:.2f}")
+
+
+def build_from_intermediate(
+    intermediate_yaml: Path,
+    output_stl: Path,
+    output_pdf: Path,
+    params: Params,
+) -> None:
+    data = load_yaml_file(intermediate_yaml)
+    if int(data.get("schema_version", 0)) != 1:
+        raise RuntimeError("Unsupported intermediate schema_version (expected 1)")
+
+    panel_cfg = data.get("panel", {})
+    if not isinstance(panel_cfg, dict):
+        raise RuntimeError("Intermediate panel section must be a mapping")
+
+    panel_size = data.get("panel_size_mm", {})
+    if not isinstance(panel_size, dict):
+        raise RuntimeError("Intermediate panel_size_mm section must be a mapping")
+
+    panel_w = float(panel_size.get("width", 0.0))
+    panel_h = float(panel_size.get("height", 0.0))
+    if panel_w <= 0.0 or panel_h <= 0.0:
+        raise RuntimeError("Intermediate panel size must have positive width/height")
+
+    base_thickness = float(panel_cfg.get("base_thickness_mm", params.base_thickness))
+    wall_height = float(panel_cfg.get("wall_height_mm", 0.0))
+    wall_thickness = float(panel_cfg.get("wall_thickness_mm", params.wall_thickness))
+    label_height = float(panel_cfg.get("label_height_mm", params.label_height))
+    pdf_grid_enabled = bool(panel_cfg.get("pdf_grid_enabled", True))
+    pdf_grid_minor_mm = float(panel_cfg.get("pdf_grid_minor_mm", 5.0))
+    pdf_grid_major_mm = float(panel_cfg.get("pdf_grid_major_mm", 25.0))
+
+    boards = data.get("boards", [])
+    if not isinstance(boards, list) or not boards:
+        raise RuntimeError("Intermediate YAML must contain a non-empty boards list")
+
+    if wall_height > 0.0:
+        outer_w = panel_w + 2.0 * wall_thickness
+        outer_h = panel_h + 2.0 * wall_thickness
+        model = cq.Workplane("XY").box(
+            outer_w,
+            outer_h,
+            base_thickness + wall_height,
+            centered=(False, False, False),
+        )
+        cavity = (
+            cq.Workplane("XY")
+            .transformed(offset=(wall_thickness, wall_thickness, base_thickness))
+            .box(panel_w, panel_h, wall_height + 0.01, centered=(False, False, False))
+        )
+        model = model.cut(cavity)
+        panel_x_offset = wall_thickness
+        panel_y_offset = wall_thickness
+    else:
+        model = cq.Workplane("XY").box(
+            panel_w,
+            panel_h,
+            base_thickness,
+            centered=(False, False, False),
+        )
+        outer_w = panel_w
+        outer_h = panel_h
+        panel_x_offset = 0.0
+        panel_y_offset = 0.0
+
+    pdf_outlines: List[List[Tuple[float, float]]] = []
+    pdf_centers: List[Dict[str, Any]] = []
+    pdf_holes: List[Dict[str, Any]] = []
+    pdf_labels: List[dict] = []
+
+    enabled_standoffs = 0
+    enabled_cutouts = 0
+    build_bar = ProgressBar(len(boards), "build")
+
+    for board in boards:
+        board_name = str(board.get("name", "board"))
+        if "x_mm" not in board or "y_mm" not in board:
+            raise RuntimeError(
+                "Intermediate YAML boards must include x_mm and y_mm; "
+                "run analyze stage or add them manually before build"
+            )
+        try:
+            float(board["x_mm"])
+            float(board["y_mm"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Intermediate YAML board x_mm/y_mm must be numeric"
+            ) from exc
+
+        features = board.get("features", {})
+        if not isinstance(features, dict):
+            build_bar.advance(board_name)
+            continue
+
+        label = features.get("label", {})
+        standoffs = features.get("standoffs", [])
+        target_center_x = float(board["x_mm"])
+        target_center_y = float(board["y_mm"])
+
+        # Board outline for PDF is derived from center/size/rotation.
+        board_w_mm = float(board.get("board_w_mm", 0.0))
+        board_h_mm = float(board.get("board_h_mm", 0.0))
+        board_rot = float(board.get("rotation_deg", 0.0))
+        if board_w_mm > 0.0 and board_h_mm > 0.0:
+            corners_local = [
+                (-board_w_mm / 2.0, -board_h_mm / 2.0),
+                (board_w_mm / 2.0, -board_h_mm / 2.0),
+                (board_w_mm / 2.0, board_h_mm / 2.0),
+                (-board_w_mm / 2.0, board_h_mm / 2.0),
+            ]
+            outline_pts: List[Tuple[float, float]] = []
+            for cx, cy in corners_local:
+                rx, ry = rotate_point(cx, cy, board_rot)
+                outline_pts.append((target_center_x + rx, target_center_y + ry))
+            pdf_outlines.append(outline_pts)
+
+        pdf_centers.append(
+            {
+                "name": board_name,
+                "x": target_center_x,
+                "y": target_center_y,
             }
         )
 
-    if all_standoff_points:
-        for placement in placements:
-            board_points = placement.get("holes_panel_xy", [])
-            if not board_points:
-                continue
+        if isinstance(standoffs, list):
+            for standoff in standoffs:
+                if not isinstance(standoff, dict) or not bool(standoff.get("enabled", True)):
+                    continue
 
-            board_standoff_diameter = float(
-                placement.get("standoff_diameter", standoff_diameter)
-            )
-            board_screw_hole_diameter = float(
-                placement.get("screw_hole_diameter", screw_hole_diameter)
-            )
+                local_x = float(standoff.get("x_local_mm", 0.0))
+                local_y = float(standoff.get("y_local_mm", 0.0))
+                rx, ry = rotate_point(local_x, local_y, board_rot)
+                standoff_x = target_center_x + rx
+                standoff_y = target_center_y + ry
+                sx = panel_x_offset + standoff_x
+                sy = panel_y_offset + standoff_y
+                standoff_d = float(standoff["standoff_diameter_mm"])
+                screw_d = float(standoff["screw_hole_diameter_mm"])
+                standoff_h = float(standoff["standoff_height_mm"])
 
-            standoffs = (
-                cq.Workplane("XY")
-                .workplane(offset=base_thickness)
-                .pushPoints(board_points)
-                .circle(board_standoff_diameter / 2.0)
-                .extrude(standoff_height)
-            )
-            panel = panel.union(standoffs)
+                standoff_solid = (
+                    cq.Workplane("XY")
+                    .workplane(offset=base_thickness)
+                    .center(sx, sy)
+                    .circle(standoff_d / 2.0)
+                    .extrude(standoff_h)
+                )
+                model = model.union(standoff_solid)
 
-            screw_holes = (
-                cq.Workplane("XY")
-                .workplane(offset=base_thickness - 0.01)
-                .pushPoints(board_points)
-                .circle(board_screw_hole_diameter / 2.0)
-                .extrude(standoff_height + 0.5)
-            )
-            panel = panel.cut(screw_holes)
+                screw_hole = (
+                    cq.Workplane("XY")
+                    .workplane(offset=base_thickness - 0.01)
+                    .center(sx, sy)
+                    .circle(screw_d / 2.0)
+                    .extrude(standoff_h + 0.5)
+                )
+                model = model.cut(screw_hole)
 
-    exporters.export(panel, str(output_stl))
+                pdf_holes.append(
+                    {
+                        "x": standoff_x,
+                        "y": standoff_y,
+                        "d": float(standoff.get("hole_diameter_mm", screw_d)),
+                        "index": int(standoff.get("hole_index", -1)),
+                    }
+                )
+                enabled_standoffs += 1
+
+        if isinstance(label, dict) and bool(label.get("enabled", True)):
+            label_local_x = float(label.get("x_local_mm", 0.0))
+            label_local_y = float(label.get("y_local_mm", 0.0))
+            lrx, lry = rotate_point(label_local_x, label_local_y, board_rot)
+            label_x = target_center_x + lrx
+            label_y = target_center_y + lry
+            tx = panel_x_offset + label_x
+            ty = panel_y_offset + label_y
+            angle = board_rot + float(label.get("rotation_deg", 0.0))
+            lines = label.get("lines", [])
+            if not isinstance(lines, list):
+                lines = [str(lines)]
+            lines = [str(line) for line in lines if str(line).strip()]
+            if lines:
+                font_size = float(label.get("font_size_mm", 2.0))
+                line_pitch = font_size * 1.28
+                total_height = line_pitch * (len(lines) - 1)
+
+                for i, line in enumerate(lines):
+                    y_offset = total_height / 2.0 - i * line_pitch
+                    text_wp = (
+                        cq.Workplane("XY")
+                        .transformed(offset=(tx, ty, base_thickness), rotate=(0, 0, angle))
+                        .center(0.0, y_offset)
+                        .text(
+                            line,
+                            fontsize=font_size,
+                            distance=label_height,
+                            combine=False,
+                            halign="center",
+                            valign="center",
+                        )
+                    )
+                    model = model.union(text_wp)
+
+                pdf_labels.append(
+                    {
+                        "x": label_x,
+                        "y": label_y,
+                        "rotation": angle,
+                        "lines": lines,
+                        "font_size_mm": font_size,
+                    }
+                )
+
+        if wall_height > 0.0:
+            cutouts = features.get("wall_cutouts", [])
+            if isinstance(cutouts, list):
+                for cutout in cutouts:
+                    if not isinstance(cutout, dict) or not bool(cutout.get("enabled", True)):
+                        continue
+
+                    side = rotate_side(str(cutout.get("side", "x-")), board_rot)
+                    cut_local_x = float(cutout.get("x_local_mm", 0.0))
+                    cut_local_y = float(cutout.get("y_local_mm", 0.0))
+                    crx, cry = rotate_point(cut_local_x, cut_local_y, board_rot)
+                    local_x = panel_x_offset + target_center_x + crx
+                    local_y = panel_y_offset + target_center_y + cry
+                    z_bottom = max(base_thickness + 0.2, base_thickness + float(cutout.get("z_bottom_mm", 0.0)))
+                    width_xy = float(cutout.get("width_mm", 0.0))
+                    height_z = float(cutout.get("height_mm", 0.0))
+                    if width_xy <= 0.0 or height_z <= 0.0:
+                        continue
+
+                    if side == "x-":
+                        cutter = (
+                            cq.Workplane("XY")
+                            .transformed(offset=(wall_thickness / 2.0, local_y, z_bottom))
+                            .box(wall_thickness + 0.8, width_xy, height_z, centered=(True, True, False))
+                        )
+                    elif side == "x+":
+                        cutter = (
+                            cq.Workplane("XY")
+                            .transformed(offset=(outer_w - wall_thickness / 2.0, local_y, z_bottom))
+                            .box(wall_thickness + 0.8, width_xy, height_z, centered=(True, True, False))
+                        )
+                    elif side == "y-":
+                        cutter = (
+                            cq.Workplane("XY")
+                            .transformed(offset=(local_x, wall_thickness / 2.0, z_bottom))
+                            .box(width_xy, wall_thickness + 0.8, height_z, centered=(True, True, False))
+                        )
+                    elif side == "y+":
+                        cutter = (
+                            cq.Workplane("XY")
+                            .transformed(offset=(local_x, outer_h - wall_thickness / 2.0, z_bottom))
+                            .box(width_xy, wall_thickness + 0.8, height_z, centered=(True, True, False))
+                        )
+                    else:
+                        raise RuntimeError(f"Invalid cutout side in intermediate YAML: {side}")
+
+                    model = model.cut(cutter)
+                    enabled_cutouts += 1
+
+        build_bar.advance(board_name)
+
+    # Center model in XY so slicers with different bed-origin assumptions place it consistently.
+    model = model.translate((-outer_w / 2.0, -outer_h / 2.0, 0.0))
+    exporters.export(model, str(output_stl))
     write_panel_standoff_template_pdf(
         output_pdf,
         panel_w,
         panel_h,
         pdf_outlines,
+        pdf_centers,
         pdf_holes,
         pdf_labels,
+        grid_enabled=pdf_grid_enabled,
+        grid_minor_mm=pdf_grid_minor_mm,
+        grid_major_mm=pdf_grid_major_mm,
     )
-    write_panel_local_holes_csv(output_local_holes_csv, local_hole_rows)
 
-    print(f"Input layout YAML: {layout_yaml}")
-    print(f"Output panel STL: {output_stl}")
-    print(f"Output panel template PDF: {output_pdf}")
-    print(f"Output local holes CSV: {output_local_holes_csv}")
-    print(f"Boards placed: {len(placements)}")
-    print(f"Total standoffs: {len(all_standoff_points)}")
+    print(f"Input intermediate YAML: {intermediate_yaml}")
+    print(f"Output enclosure STL: {output_stl}")
+    print(f"Output standoff template PDF: {output_pdf}")
     print(f"Panel size (mm): {panel_w:.2f} x {panel_h:.2f}")
-    print("Board local holes:")
-    for placement in placements:
-        print(
-            "  "
-            f"{placement['name']}: "
-            f"detected={placement['detected_holes']}, "
-            f"excluded={placement['excluded_holes']}, "
-            f"active={placement['active_holes']}"
-        )
-    for row in local_hole_rows:
-        print(
-            "  "
-            f"{row['board']} idx={row['hole_index']} "
-            f"xy=({row['x_local_mm']}, {row['y_local_mm']}) "
-            f"d={row['diameter_mm']} "
-            f"excluded={row['excluded']} {row['reason']}"
-        )
+    print(f"Enabled standoffs: {enabled_standoffs}")
+    print(f"Enabled wall cutouts: {enabled_cutouts}")
+    if wall_height <= 0.0:
+        print("Mode: panel/base only (wall_height_mm <= 0)")
+    else:
+        print(f"Wall height (mm): {wall_height:.2f}")
+
+
+def build_panel(
+    layout_yaml: Path,
+    output_stl: Path,
+    output_pdf: Path,
+    output_local_holes_csv: Path,
+    params: Params,
+) -> None:
+    intermediate_yaml = layout_yaml.with_name(f"{layout_yaml.stem}_intermediate.yaml")
+    analyze_layout_to_intermediate(layout_yaml, intermediate_yaml, output_local_holes_csv, params)
+    build_from_intermediate(intermediate_yaml, output_stl, output_pdf, params)
+    print("Compatibility mode: --layout-yaml now uses analyze + build via intermediate YAML.")
 
 
 def build_enclosure(
@@ -983,6 +1607,8 @@ def build_enclosure(
 
         enclosure = enclosure.cut(cutter)
 
+    # Center model in XY so slicers with different bed-origin assumptions place it consistently.
+    enclosure = enclosure.translate((-outer_w / 2.0, -outer_h / 2.0, 0.0))
     exporters.export(enclosure, str(output_stl))
 
     print(f"Input PCB STEP: {step_path}")
@@ -1015,7 +1641,25 @@ def parse_args() -> argparse.Namespace:
         "--layout-yaml",
         type=Path,
         default=None,
-        help="YAML layout for multi-board panel mode.",
+        help="Compatibility mode: source YAML layout analyzed then built via intermediate file.",
+    )
+    parser.add_argument(
+        "--analyze-layout",
+        type=Path,
+        default=None,
+        help="Analyze source layout YAML and write intermediate YAML feature file.",
+    )
+    parser.add_argument(
+        "--build-from-intermediate",
+        type=Path,
+        default=None,
+        help="Build STL and template PDF from intermediate YAML feature file.",
+    )
+    parser.add_argument(
+        "--intermediate-output",
+        type=Path,
+        default=None,
+        help="Output path for intermediate YAML (used with --analyze-layout or --layout-yaml).",
     )
     parser.add_argument(
         "--pdf-output",
@@ -1047,17 +1691,48 @@ def main() -> None:
     args = parse_args()
     params = Params()
 
+    if args.analyze_layout:
+        layout_yaml = args.analyze_layout
+        if not layout_yaml.exists():
+            raise SystemExit(f"Layout YAML not found: {layout_yaml}")
+
+        intermediate_output = args.intermediate_output or layout_yaml.with_name(
+            f"{layout_yaml.stem}_intermediate.yaml"
+        )
+        output_local_holes_csv = args.panel_local_holes_csv or layout_yaml.with_name(
+            f"{layout_yaml.stem}_local_holes.csv"
+        )
+        analyze_layout_to_intermediate(layout_yaml, intermediate_output, output_local_holes_csv, params)
+        return
+
+    if args.build_from_intermediate:
+        intermediate_yaml = args.build_from_intermediate
+        if not intermediate_yaml.exists():
+            raise SystemExit(f"Intermediate YAML not found: {intermediate_yaml}")
+
+        output = args.output or intermediate_yaml.with_name(f"{intermediate_yaml.stem}_panel.stl")
+        output_pdf = args.pdf_output or intermediate_yaml.with_name(
+            f"{intermediate_yaml.stem}_panel_template.pdf"
+        )
+        build_from_intermediate(intermediate_yaml, output, output_pdf, params)
+        return
+
     if args.layout_yaml:
         layout_yaml = args.layout_yaml
         if not layout_yaml.exists():
             raise SystemExit(f"Layout YAML not found: {layout_yaml}")
 
+        intermediate_output = args.intermediate_output or layout_yaml.with_name(
+            f"{layout_yaml.stem}_intermediate.yaml"
+        )
         output = args.output or layout_yaml.with_name(f"{layout_yaml.stem}_panel.stl")
         output_pdf = args.pdf_output or layout_yaml.with_name(f"{layout_yaml.stem}_panel_template.pdf")
         output_local_holes_csv = args.panel_local_holes_csv or layout_yaml.with_name(
             f"{layout_yaml.stem}_local_holes.csv"
         )
-        build_panel(layout_yaml, output, output_pdf, output_local_holes_csv, params)
+        analyze_layout_to_intermediate(layout_yaml, intermediate_output, output_local_holes_csv, params)
+        build_from_intermediate(intermediate_output, output, output_pdf, params)
+        print("Compatibility mode: use --analyze-layout and --build-from-intermediate for explicit two-step flow.")
         return
 
     if not args.pcb_step:
